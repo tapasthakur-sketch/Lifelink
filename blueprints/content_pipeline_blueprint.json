@@ -1,0 +1,427 @@
+{
+  "version": "1.0",
+  "meta": {
+    "name": "Daily Blog + Video Pipeline",
+    "description": "Automated topic -> blog -> video -> publish -> log pipeline with validation, retries, and parallel branches",
+    "owner": "automation"
+  },
+  "env": [
+    "OPENAI_API_KEY",
+    "NICHE",
+    "SCHEDULE_CRON",
+    "CMS_BASE_URL",
+    "CMS_TOKEN",
+    "VIDEO_API_URL",
+    "VIDEO_API_KEY",
+    "YOUTUBE_CLIENT_ID",
+    "YOUTUBE_CLIENT_SECRET",
+    "YOUTUBE_REFRESH_TOKEN",
+    "SHEETS_SPREADSHEET_ID",
+    "GOOGLE_SERVICE_ACCOUNT_EMAIL",
+    "GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY"
+  ],
+  "defaults": {
+    "retry_policy": {
+      "strategy": "exponential_backoff",
+      "base_ms": 1000,
+      "factor": 2,
+      "max_retries": 4,
+      "jitter": true
+    },
+    "timezone": "UTC",
+    "rate_limits": {
+      "openai_rpm": 200,
+      "youtube_quota_daily": 9500
+    }
+  },
+  "schemas": {
+    "Topic": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["topic", "primary_keyword", "audience"],
+      "properties": {
+        "topic": {"type": "string", "minLength": 8},
+        "primary_keyword": {"type": "string"},
+        "audience": {"type": "string"},
+        "intent": {"type": "string", "enum": ["informational", "transactional", "commercial", "navigational"]}
+      }
+    },
+    "BlogPost": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["title", "slug", "excerpt", "keywords", "body_markdown", "meta_description", "hero_image_prompt", "reading_time_minutes"],
+      "properties": {
+        "title": {"type": "string", "minLength": 10},
+        "slug": {"type": "string"},
+        "excerpt": {"type": "string", "minLength": 50},
+        "keywords": {"type": "array", "items": {"type": "string"}, "minItems": 3},
+        "body_markdown": {"type": "string", "minLength": 1000},
+        "meta_description": {"type": "string", "minLength": 80},
+        "hero_image_prompt": {"type": "string"},
+        "reading_time_minutes": {"type": "number"}
+      }
+    },
+    "VideoScript": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["title", "hook", "scenes", "cta", "voice"],
+      "properties": {
+        "title": {"type": "string"},
+        "hook": {"type": "string", "minLength": 20},
+        "scenes": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "required": ["narration", "visual_hint"],
+            "properties": {
+              "narration": {"type": "string", "minLength": 20},
+              "visual_hint": {"type": "string"},
+              "on_screen_text": {"type": "string"}
+            }
+          }
+        },
+        "cta": {"type": "string"},
+        "voice": {"type": "string", "enum": ["neutral", "female", "male"]}
+      }
+    },
+    "LogRecord": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "required": ["timestamp", "run_id", "step", "status"],
+      "properties": {
+        "timestamp": {"type": "string"},
+        "run_id": {"type": "string"},
+        "step": {"type": "string"},
+        "status": {"type": "string", "enum": ["success", "failed"]},
+        "topic": {"type": "string"},
+        "cms_url": {"type": "string"},
+        "youtube_id": {"type": "string"},
+        "word_count": {"type": "number"},
+        "total_words_video": {"type": "number"},
+        "api_cost_usd": {"type": "number"},
+        "latency_ms": {"type": "number"},
+        "retries": {"type": "number"},
+        "error_code": {"type": "string"},
+        "error_desc": {"type": "string"}
+      }
+    }
+  },
+  "nodes": [
+    {
+      "id": "n1",
+      "type": "scheduler.cron",
+      "name": "Daily Scheduler",
+      "enabled": true,
+      "config": {
+        "cron": "${SCHEDULE_CRON:-0 9 * * *}",
+        "timezone": "UTC"
+      },
+      "output": {
+        "run_id": "{{ uuid() }}",
+        "niche": "${NICHE}"
+      }
+    },
+    {
+      "id": "n2",
+      "type": "openai.chat",
+      "name": "Generate Topic",
+      "enabled": true,
+      "auth": { "apiKey": "${OPENAI_API_KEY}" },
+      "config": {
+        "model": "gpt-4o-mini",
+        "response_format": "json_object",
+        "temperature": 0.7,
+        "messages": [
+          { "role": "system", "content": "You are an expert SEO content strategist. Return JSON only." },
+          { "role": "user", "content": "Generate 1 trending, SEO-friendly topic for \"{{inputs.niche}}\". Return JSON with fields: topic, primary_keyword, audience, intent." }
+        ]
+      },
+      "outputs": {
+        "json": "{{ jsonParse(response.choices[0].message.content) }}"
+      },
+      "contracts": { "output_schema_ref": "Topic" },
+      "idempotency_key": "topic:{{ hash(outputs.json.topic) }}",
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n3",
+      "type": "filter",
+      "name": "Topic Quality Gate",
+      "enabled": true,
+      "config": {
+        "conditions": [
+          { "field": "$.json.topic", "operator": "exists" },
+          { "field": "$.json.primary_keyword", "operator": "exists" },
+          { "field": "$.json.audience", "operator": "exists" },
+          { "field": "$.json.topic", "operator": "min_length", "value": 8 }
+        ]
+      }
+    },
+    {
+      "id": "n4",
+      "type": "openai.chat",
+      "name": "Generate Blog Post",
+      "enabled": true,
+      "auth": { "apiKey": "${OPENAI_API_KEY}" },
+      "config": {
+        "model": "gpt-4o",
+        "response_format": "json_object",
+        "temperature": 0.7,
+        "messages": [
+          { "role": "system", "content": "You are a senior technical writer. Output JSON only." },
+          { "role": "user", "content": "Write a ~1200-word SEO blog post for topic: '{{nodes.n2.outputs.json.topic}}' targeting: '{{nodes.n2.outputs.json.audience}}' with primary keyword: '{{nodes.n2.outputs.json.primary_keyword}}'. Return JSON with: title, slug, excerpt, keywords[], body_markdown, meta_description, hero_image_prompt, reading_time_minutes. Rules: body_markdown must use H2 sections, bullet lists, and include a Conclusion section." }
+        ]
+      },
+      "outputs": {
+        "json": "{{ jsonParse(response.choices[0].message.content) }}"
+      },
+      "contracts": { "output_schema_ref": "BlogPost" },
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n5",
+      "type": "transform.javascript",
+      "name": "Blog Metrics",
+      "enabled": true,
+      "config": {
+        "code": "const body = inputs.blog.body_markdown || '';\nconst words = body.trim().split(/\\s+/).filter(Boolean);\nconst word_count = words.length;\nconst has_conclusion = /(^|\\n)##?\\s+conclusion/i.test(body);\nconst has_h2 = /(^|\\n)##\\s+/.test(body);\nreturn { word_count, has_conclusion, has_h2 };",
+        "inputs": { "blog": "{{ nodes.n4.outputs.json }}" }
+      }
+    },
+    {
+      "id": "n6",
+      "type": "filter",
+      "name": "Blog Quality Gate",
+      "enabled": true,
+      "config": {
+        "conditions": [
+          { "field": "$.word_count", "operator": ">=", "value": 1000 },
+          { "field": "$.has_conclusion", "operator": "==", "value": true },
+          { "field": "$.has_h2", "operator": "==", "value": true }
+        ]
+      }
+    },
+    {
+      "id": "n7",
+      "type": "openai.images",
+      "name": "Generate Hero Image (optional)",
+      "enabled": false,
+      "auth": { "apiKey": "${OPENAI_API_KEY}" },
+      "config": {
+        "model": "gpt-image-1",
+        "prompt": "{{ nodes.n4.outputs.json.hero_image_prompt }}",
+        "size": "1024x1024"
+      },
+      "outputs": {
+        "image_url": "{{ response.data[0].url }}"
+      }
+    },
+    {
+      "id": "n8",
+      "type": "http.request",
+      "name": "CMS Publish",
+      "enabled": true,
+      "auth": { "type": "bearer", "token": "${CMS_TOKEN}" },
+      "config": {
+        "method": "POST",
+        "url": "${CMS_BASE_URL}/posts",
+        "headers": { "Content-Type": "application/json" },
+        "body": "{\n  \"title\": \"{{ nodes.n4.outputs.json.title }}\",\n  \"slug\": \"{{ nodes.n4.outputs.json.slug }}\",\n  \"excerpt\": \"{{ nodes.n4.outputs.json.excerpt }}\",\n  \"keywords\": {{ jsonStringify(nodes.n4.outputs.json.keywords) }},\n  \"body_markdown\": {{ jsonStringify(nodes.n4.outputs.json.body_markdown) }},\n  \"meta_description\": \"{{ nodes.n4.outputs.json.meta_description }}\",\n  \"hero_image_url\": \"{{ nodes.n7.outputs.image_url || '' }}\"\n}",
+        "expect": { "status": [200, 201] }
+      },
+      "outputs": {
+        "cms_url": "{{ response.data.url || response.data.permalink || '' }}"
+      },
+      "idempotency_key": "cms:{{ hash(nodes.n4.outputs.json.slug) }}",
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n9",
+      "type": "openai.chat",
+      "name": "Generate Video Script",
+      "enabled": true,
+      "auth": { "apiKey": "${OPENAI_API_KEY}" },
+      "config": {
+        "model": "gpt-4o-mini",
+        "response_format": "json_object",
+        "temperature": 0.8,
+        "messages": [
+          { "role": "system", "content": "You are a short-form video scriptwriter. Output JSON only." },
+          { "role": "user", "content": "Create a ~90-second video script on '{{nodes.n2.outputs.json.topic}}' for '{{nodes.n2.outputs.json.audience}}'. Return JSON with: title, hook, scenes[{narration, visual_hint, on_screen_text?}], cta, voice (neutral|female|male). Keep narration 180-220 words total." }
+        ]
+      },
+      "outputs": {
+        "json": "{{ jsonParse(response.choices[0].message.content) }}"
+      },
+      "contracts": { "output_schema_ref": "VideoScript" },
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n10",
+      "type": "transform.javascript",
+      "name": "Video Metrics",
+      "enabled": true,
+      "config": {
+        "code": "const v = inputs.video;\nconst arr = [v.hook, ...(v.scenes||[]).map(s=>s.narration), v.cta].filter(Boolean);\nconst totalWords = arr.join(' ').trim().split(/\\s+/).filter(Boolean).length;\nreturn { total_words: totalWords };",
+        "inputs": { "video": "{{ nodes.n9.outputs.json }}" }
+      }
+    },
+    {
+      "id": "n11",
+      "type": "filter",
+      "name": "Video Quality Gate",
+      "enabled": true,
+      "config": {
+        "conditions": [
+          { "field": "$.total_words", "operator": ">=", "value": 160 },
+          { "field": "$.total_words", "operator": "<=", "value": 260 }
+        ]
+      }
+    },
+    {
+      "id": "n12",
+      "type": "http.request",
+      "name": "Render Video",
+      "enabled": true,
+      "auth": { "type": "api_key", "header": "X-API-Key", "value": "${VIDEO_API_KEY}" },
+      "config": {
+        "method": "POST",
+        "url": "${VIDEO_API_URL}/render",
+        "headers": { "Content-Type": "application/json" },
+        "body": "{\n  \"title\": \"{{ nodes.n9.outputs.json.title }}\",\n  \"voice\": \"{{ nodes.n9.outputs.json.voice }}\",\n  \"scenes\": {{ jsonStringify(nodes.n9.outputs.json.scenes) }}\n}",
+        "expect": { "status": [200, 201] }
+      },
+      "outputs": {
+        "video_file_url": "{{ response.data.file_url || response.data.url }}"
+      },
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n13",
+      "type": "google.youtube.upload",
+      "name": "YouTube Upload",
+      "enabled": true,
+      "auth": {
+        "type": "oauth2",
+        "client_id": "${YOUTUBE_CLIENT_ID}",
+        "client_secret": "${YOUTUBE_CLIENT_SECRET}",
+        "refresh_token": "${YOUTUBE_REFRESH_TOKEN}"
+      },
+      "config": {
+        "privacyStatus": "public",
+        "title": "{{ nodes.n9.outputs.json.title }}",
+        "description": "Related article: {{ nodes.n8.outputs.cms_url }}",
+        "tags": "{{ jsonStringify(nodes.n4.outputs.json.keywords) }}",
+        "file_url": "{{ nodes.n12.outputs.video_file_url }}"
+      },
+      "outputs": {
+        "youtube_id": "{{ response.data.id || response.data.items[0].id }}"
+      },
+      "retry_policy_ref": "default"
+    },
+    {
+      "id": "n14",
+      "type": "gate.join",
+      "name": "Wait for Publish + Upload",
+      "enabled": true,
+      "config": { "wait_for": ["n8", "n13"], "timeout_ms": 1800000 }
+    },
+    {
+      "id": "n15",
+      "type": "google.sheets.append",
+      "name": "Log Success",
+      "enabled": true,
+      "auth": {
+        "type": "service_account",
+        "client_email": "${GOOGLE_SERVICE_ACCOUNT_EMAIL}",
+        "private_key": "${GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY}"
+      },
+      "config": {
+        "spreadsheet_id": "${SHEETS_SPREADSHEET_ID}",
+        "range": "Log!A1",
+        "values": [
+          "{{ now() }}",
+          "{{ nodes.n1.outputs.run_id }}",
+          "run_complete",
+          "success",
+          "{{ nodes.n2.outputs.json.topic }}",
+          "{{ nodes.n8.outputs.cms_url }}",
+          "{{ nodes.n13.outputs.youtube_id }}",
+          "{{ nodes.n5.outputs.word_count }}",
+          "{{ nodes.n10.outputs.total_words }}",
+          "{{ cost() }}",
+          "{{ latency() }}",
+          "{{ retries() }}",
+          "",
+          ""
+        ]
+      }
+    },
+    {
+      "id": "n16",
+      "type": "google.sheets.append",
+      "name": "Log Failure",
+      "enabled": true,
+      "on_error_only": true,
+      "auth": {
+        "type": "service_account",
+        "client_email": "${GOOGLE_SERVICE_ACCOUNT_EMAIL}",
+        "private_key": "${GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY}"
+      },
+      "config": {
+        "spreadsheet_id": "${SHEETS_SPREADSHEET_ID}",
+        "range": "Log!A1",
+        "values": [
+          "{{ now() }}",
+          "{{ nodes.n1.outputs.run_id }}",
+          "{{ error().step || 'unknown' }}",
+          "failed",
+          "{{ nodes.n2.outputs.json.topic || '' }}",
+          "",
+          "",
+          "",
+          "",
+          "",
+          "{{ latency() }}",
+          "{{ retries() }}",
+          "{{ error().code || '' }}",
+          "{{ error().message || '' }}"
+        ]
+      }
+    },
+    {
+      "id": "n17",
+      "type": "queue.push",
+      "name": "DLQ Push",
+      "enabled": true,
+      "on_error_only": true,
+      "config": {
+        "provider": "redis",
+        "queue": "pipeline:dlq",
+        "payload": "{{ jsonStringify(error()) }}"
+      }
+    }
+  ],
+  "edges": [
+    { "from": "n1", "to": "n2" },
+    { "from": "n2", "to": "n3" },
+    { "from": "n3", "to": "n4", "when": "pass" },
+    { "from": "n3", "to": "n9", "when": "pass" },
+    { "from": "n4", "to": "n5" },
+    { "from": "n5", "to": "n6" },
+    { "from": "n6", "to": "n7", "when": "pass" },
+    { "from": "n6", "to": "n8", "when": "pass" },
+    { "from": "n7", "to": "n8" },
+    { "from": "n9", "to": "n10" },
+    { "from": "n10", "to": "n11" },
+    { "from": "n11", "to": "n12", "when": "pass" },
+    { "from": "n12", "to": "n13" },
+    { "from": "n8", "to": "n14" },
+    { "from": "n13", "to": "n14" },
+    { "from": "n14", "to": "n15" },
+    { "from": "*", "to": "n16", "when": "error" },
+    { "from": "*", "to": "n17", "when": "error" }
+  ]
+}
